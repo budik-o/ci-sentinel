@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import Mock
 
@@ -9,7 +10,7 @@ import pytest
 import requests
 
 from ci_sentinel import github_client
-from ci_sentinel.github_actions import Repository
+from ci_sentinel.github_actions import Repository, list_failed_workflow_runs
 from ci_sentinel.github_client import (
     API_ROOT,
     GitHubApiError,
@@ -204,3 +205,51 @@ def test_client_rejects_invalid_timeout(timeout: tuple[float, float]) -> None:
     with pytest.raises(ValueError, match="positive"):
         GitHubClient(timeout=timeout)
 
+
+def sample_run(run_id: int = 123) -> dict[str, object]:
+    return {
+        "id": run_id,
+        "name": "CI",
+        "head_branch": "main",
+        "created_at": "2026-10-20T12:00:00Z",
+        "run_attempt": 1,
+        "html_url": f"https://github.com/owner/repo/actions/runs/{run_id}",
+    }
+
+
+def mock_runs_client(payload: object) -> tuple[GitHubClient, Mock]:
+    session = Mock(spec=requests.Session)
+    session.get.return_value = make_response(200, json.dumps(payload))
+    return GitHubClient(session=session), session
+
+
+def test_list_failed_runs_fetches_and_parses_results() -> None:
+    client, session = mock_runs_client({"workflow_runs": [sample_run()]})
+
+    runs = list_failed_workflow_runs(client, Repository.parse("owner/repo"), limit=5)
+
+    assert len(runs) == 1
+    assert runs[0].run_id == 123
+    assert runs[0].name == "CI"
+    assert runs[0].branch == "main"
+    assert runs[0].created_at == datetime(2026, 10, 20, 12, tzinfo=timezone.utc)
+    assert session.get.call_args.args == (f"{API_ROOT}/repos/owner/repo/actions/runs",)
+    assert session.get.call_args.kwargs["params"] == {"status": "failure", "per_page": 5}
+
+
+def test_list_failed_runs_handles_empty_results() -> None:
+    client, _ = mock_runs_client({"workflow_runs": []})
+    assert list_failed_workflow_runs(client, Repository.parse("owner/repo")) == []
+
+
+def test_list_failed_runs_rejects_bad_response() -> None:
+    client, _ = mock_runs_client({"unexpected": []})
+    with pytest.raises(GitHubApiError, match="workflow_runs"):
+        list_failed_workflow_runs(client, Repository.parse("owner/repo"))
+
+
+def test_list_failed_runs_propagates_http_errors() -> None:
+    session = Mock(spec=requests.Session)
+    session.get.return_value = make_response(403)
+    with pytest.raises(GitHubApiError, match="forbidden"):
+        list_failed_workflow_runs(GitHubClient(session=session), Repository.parse("owner/repo"))
