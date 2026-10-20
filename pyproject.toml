@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ci-sentinel"
+version = "0.1.0"
+description = "GitHub Actions failure diagnostics with LLM analysis and Prometheus observability."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=2.23,<3",
+    "prometheus-client>=0.21,<1",
+    "pydantic>=2.12.5,<3",
+    "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.17,<2",
+    "pytest>=8.4,<10",
+    "requests-mock>=1.12,<2",
+    "ruff>=0.13,<1",
+    "types-requests>=2.32,<3",
+]
+
+[project.scripts]
+ci-sentinel = "ci_sentinel.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ci_sentinel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+files = ["src/ci_sentinel"]
