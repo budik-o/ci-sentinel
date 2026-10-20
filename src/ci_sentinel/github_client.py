@@ -1,21 +1,28 @@
-"""GitHub REST API constants, auth headers, and error translation."""
+"""Shared HTTP client, auth, and errors for the GitHub REST API."""
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
+from types import TracebackType
 
 import requests
 
 API_ROOT = "https://api.github.com"
 API_VERSION = "2026-03-10"
+DEFAULT_TIMEOUT = (5.0, 30.0)  # Connection timeout, read timeout (seconds).
 
 
 class GitHubApiError(RuntimeError):
-    """Raised when GitHub returns an unsuccessful HTTP response."""
+    """Raised when a GitHub API request fails."""
 
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class GitHubTransportError(GitHubApiError):
+    """Raised when an HTTP request cannot be completed."""
 
 
 def auth_headers(token: str | None = None) -> dict[str, str]:
@@ -23,6 +30,7 @@ def auth_headers(token: str | None = None) -> dict[str, str]:
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": API_VERSION,
+        "User-Agent": "ci-sentinel",
     }
     actual_token = token if token is not None else os.environ.get("GITHUB_TOKEN")
     if actual_token:
@@ -57,8 +65,77 @@ def raise_for_error_response(response: requests.Response) -> None:
     elif status >= 500:
         message = f"GitHub server error ({status}): retry later."
     else:
-        # Cap untrusted error details to avoid filling CLI output.
+        # Cap untrusted error details to avoid filling CLI output with a response body.
         snippet = response.text[:200].replace("\n", " ")
         message = f"GitHub API request failed ({status}): {snippet}"
 
     raise GitHubApiError(message, status_code=status)
+
+
+class GitHubClient:
+    """Reusable HTTP client for GitHub API GET requests.
+
+    An injected session is owned by its caller; otherwise this client owns
+    the session and closes it when used as a context manager.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        session: requests.Session | None = None,
+        timeout: tuple[float, float] = DEFAULT_TIMEOUT,
+    ) -> None:
+        if any(value <= 0 for value in timeout):
+            raise ValueError("HTTP timeout values must be positive.")
+        self._session = session if session is not None else requests.Session()
+        self._owns_session = session is None
+        self._headers = auth_headers(token)
+        self._timeout = timeout
+
+    def get(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, str | int] | None = None,
+        stream: bool = False,
+    ) -> requests.Response:
+        """GET a GitHub API path; validate HTTP status and propagate errors."""
+        if not path.startswith("/") or path.startswith("//"):
+            raise ValueError("GitHub API path must start with a single '/'.")
+
+        try:
+            response = self._session.get(
+                f"{API_ROOT}{path}",
+                headers=self._headers,
+                params=params,
+                timeout=self._timeout,
+                stream=stream,
+            )
+        except requests.Timeout as exc:
+            raise GitHubTransportError("GitHub API request timed out.") from exc
+        except requests.RequestException as exc:
+            raise GitHubTransportError(f"GitHub API network request failed: {exc}") from exc
+
+        try:
+            raise_for_error_response(response)
+        except GitHubApiError:
+            response.close()
+            raise
+        return response
+
+    def close(self) -> None:
+        """Close the session only if this client created it."""
+        if self._owns_session:
+            self._session.close()
+
+    def __enter__(self) -> GitHubClient:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()

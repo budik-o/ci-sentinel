@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import Mock
 
 import pytest
 import requests
 
+from ci_sentinel import github_client
 from ci_sentinel.github_actions import Repository
-from ci_sentinel.github_client import GitHubApiError, auth_headers, raise_for_error_response
+from ci_sentinel.github_client import (
+    API_ROOT,
+    GitHubApiError,
+    GitHubClient,
+    GitHubTransportError,
+    auth_headers,
+    raise_for_error_response,
+)
 from ci_sentinel.iso_datetime import parse_iso_datetime
 
 
@@ -98,3 +107,100 @@ def test_parse_offset_timestamp() -> None:
 def test_reject_invalid_or_naive_timestamp(value: str) -> None:
     with pytest.raises(ValueError):
         parse_iso_datetime(value)
+
+
+def test_client_get_passes_headers_params_and_timeout() -> None:
+    session = Mock(spec=requests.Session)
+    response = make_response(200, '{"ok": true}')
+    session.get.return_value = response
+
+    client = GitHubClient(token="test-token", session=session)
+    result = client.get("/repos/octocat/Hello-World", params={"per_page": 10})
+
+    assert result is response
+    session.get.assert_called_once_with(
+        f"{API_ROOT}/repos/octocat/Hello-World",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2026-03-10",
+            "User-Agent": "ci-sentinel",
+            "Authorization": "Bearer test-token",
+        },
+        params={"per_page": 10},
+        timeout=(5.0, 30.0),
+        stream=False,
+    )
+
+
+def test_client_supports_streaming_and_custom_timeout() -> None:
+    session = Mock(spec=requests.Session)
+    session.get.return_value = make_response(200, "log text")
+    client = GitHubClient(session=session, timeout=(2.0, 15.0))
+
+    client.get("/repos/example/repo/actions/jobs/123/logs", stream=True)
+
+    assert session.get.call_args.kwargs["stream"] is True
+    assert session.get.call_args.kwargs["timeout"] == (2.0, 15.0)
+
+
+@pytest.mark.parametrize(
+    "path", ["repos/owner/repo", "//evil.example/path", "https://evil.example"]
+)
+def test_client_rejects_non_api_paths(path: str) -> None:
+    session = Mock(spec=requests.Session)
+    with pytest.raises(ValueError, match="must start"):
+        GitHubClient(session=session).get(path)
+    session.get.assert_not_called()
+
+
+@pytest.mark.parametrize("timeout_error", [requests.ConnectTimeout, requests.ReadTimeout])
+def test_client_converts_timeouts(timeout_error: type[requests.Timeout]) -> None:
+    session = Mock(spec=requests.Session)
+    session.get.side_effect = timeout_error("timed out")
+
+    with pytest.raises(GitHubTransportError, match="timed out") as exc_info:
+        GitHubClient(session=session).get("/rate_limit")
+    assert exc_info.value.status_code is None
+    assert isinstance(exc_info.value.__cause__, requests.Timeout)
+
+
+def test_client_converts_connection_error() -> None:
+    session = Mock(spec=requests.Session)
+    session.get.side_effect = requests.ConnectionError("connection refused")
+
+    with pytest.raises(GitHubTransportError, match="connection refused"):
+        GitHubClient(session=session).get("/rate_limit")
+
+
+def test_client_closes_failed_http_responses() -> None:
+    response = make_response(404)
+    response.close = Mock()
+    session = Mock(spec=requests.Session)
+    session.get.return_value = response
+
+    with pytest.raises(GitHubApiError) as exc_info:
+        GitHubClient(session=session).get("/repos/missing/missing")
+    assert exc_info.value.status_code == 404
+    response.close.assert_called_once_with()
+
+
+def test_client_does_not_close_injected_session() -> None:
+    session = Mock(spec=requests.Session)
+    with GitHubClient(session=session):
+        pass
+    session.close.assert_not_called()
+
+
+def test_client_closes_owned_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = Mock(spec=requests.Session)
+    monkeypatch.setattr(github_client.requests, "Session", Mock(return_value=session))
+    with github_client.GitHubClient():
+        pass
+    session.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("timeout", [(0.0, 5.0), (5.0, -1.0)])
+def test_client_rejects_invalid_timeout(timeout: tuple[float, float]) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        GitHubClient(timeout=timeout)
+
