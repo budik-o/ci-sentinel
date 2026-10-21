@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import UTC
 
+from google import genai
+
 from ci_sentinel import __version__
+from ci_sentinel.analyzer import GeminiAnalysisError, analyze_log
 from ci_sentinel.github_actions import (
     Repository,
     download_job_logs,
@@ -68,7 +72,20 @@ def main(argv: list[str] | None = None) -> int:
     inspect.add_argument(
         "--attempt", type=_positive_int_arg, metavar="N", help="Inspect a specific run attempt."
     )
-    inspect.add_argument("--logs", action="store_true", help="Print full logs for failed jobs.")
+    inspect.add_argument(
+        "--logs", action="store_true", help="Print shortened logs for failed jobs."
+    )
+
+    analysis = commands.add_parser("analyze", help="Diagnose failed jobs with Gemini.")
+    analysis.add_argument("repository", type=_repository_arg, metavar="owner/repo")
+    analysis.add_argument(
+        "--limit",
+        type=_limit_arg,
+        choices=range(1, 6),
+        default=1,
+        metavar="N",
+        help="Number of recent failed workflow runs to analyze (1-5; default: 1).",
+    )
 
     try:
         args = parser.parse_args(argv)
@@ -78,6 +95,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 2
+
+    if args.command == "analyze" and not (
+        os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    ):
+        print("Error: Set GEMINI_API_KEY to run AI analysis.", file=sys.stderr)
+        return 1
 
     try:
         with GitHubClient() as client:
@@ -94,9 +117,52 @@ def main(argv: list[str] | None = None) -> int:
                         print(truncate_log(download_job_logs(client, args.repository, job.job_id)))
                 return 0
 
+            if args.command == "analyze":
+                runs = list_failed_workflow_runs(client, args.repository, limit=args.limit)
+                if not runs:
+                    print(f"No failed workflow runs found for {args.repository}.")
+                    return 0
+
+                analyzed = 0
+                failed = 0
+
+                with genai.Client() as gemini_client:
+                    for run in runs:
+                        jobs = list_failed_jobs(
+                            client, args.repository, run.run_id, attempt=run.attempt
+                        )
+                        for job in jobs:
+                            log = truncate_log(
+                                download_job_logs(client, args.repository, job.job_id)
+                            )
+                            if not log.strip():
+                                continue
+
+                            try:
+                                report = analyze_log(log, client=gemini_client)
+                            except GeminiAnalysisError as exc:
+                                print(f"Gemini analysis failed for job {job.job_id}: {exc}", file=sys.stderr)
+                                failed += 1
+                                continue
+
+                            print(f"Run {run.run_id} | {job.name} (job {job.job_id})")
+                            print(report.model_dump_json(indent=2))
+                            analyzed += 1
+
+                if analyzed == 0 and failed == 0:
+                    print(f"No failed jobs with logs found for {args.repository}.")
+                else:
+                    print(f"\nAnalysis complete: {analyzed} successful, {failed} failed.")
+
+                return 1 if failed else 0
+
             runs = list_failed_workflow_runs(client, args.repository, limit=args.limit)
     except GitHubApiError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"GitHub API error: {exc}", file=sys.stderr)
+        return 1
+
+    except GeminiAnalysisError as exc:
+        print(f"Gemini analysis error: {exc}", file=sys.stderr)
         return 1
 
     if not runs:

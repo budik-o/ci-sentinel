@@ -120,3 +120,113 @@ def test_inspect_run_truncates_long_logs(capsys: pytest.CaptureFixture[str]) -> 
     assert "earlier log output omitted" in output
     assert "error: tests failed" in output
     assert raw_log not in output
+
+
+def test_analyze_runs_diagnostics_with_truncated_logs(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ci_sentinel.analyzer import DiagnosticReport
+    from ci_sentinel.github_actions import WorkflowJob
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    run = WorkflowRun(
+        123, "CI", "main", datetime(2026, 10, 20, tzinfo=UTC), 2,
+        "https://github.com/owner/repo/actions/runs/123",
+    )
+    job = WorkflowJob(11, "test", "failure", "https://github.com/owner/repo/actions/jobs/11")
+    report = DiagnosticReport(
+        category="test", root_cause="Assertion failed", suggested_fix="Fix assertion",
+        confidence_score=0.9,
+    )
+    long_log = "setup output\n" * 2000 + "error: assertion failed"
+
+    with (
+        patch("ci_sentinel.cli.GitHubClient"),
+        patch("ci_sentinel.cli.genai.Client"),
+        patch("ci_sentinel.cli.list_failed_workflow_runs", return_value=[run]) as get_runs,
+        patch("ci_sentinel.cli.list_failed_jobs", return_value=[job]) as get_jobs,
+        patch("ci_sentinel.cli.download_job_logs", return_value=long_log),
+        patch("ci_sentinel.cli.analyze_log", return_value=report) as analyze,
+    ):
+        assert main(["analyze", "owner/repo"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Run 123" in output
+    assert '"category": "test"' in output
+    assert get_runs.call_args.kwargs["limit"] == 1
+    assert get_jobs.call_args.kwargs["attempt"] == 2
+    assert len(analyze.call_args.args[0]) == 12_000
+    assert analyze.call_args.args[0].endswith("error: assertion failed")
+
+
+def test_analyze_handles_empty_runs(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    with (
+        patch("ci_sentinel.cli.GitHubClient"),
+        patch("ci_sentinel.cli.genai.Client") as gemini,
+        patch("ci_sentinel.cli.list_failed_workflow_runs", return_value=[]),
+    ):
+        assert main(["analyze", "owner/repo"]) == 0
+    assert "No failed workflow runs" in capsys.readouterr().out
+    gemini.assert_not_called()
+
+
+def test_analyze_handles_empty_jobs(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    run = WorkflowRun(
+        123, "CI", "main", datetime(2026, 10, 20, tzinfo=UTC), 1,
+        "https://github.com/owner/repo/actions/runs/123",
+    )
+    with (
+        patch("ci_sentinel.cli.GitHubClient"),
+        patch("ci_sentinel.cli.genai.Client"),
+        patch("ci_sentinel.cli.list_failed_workflow_runs", return_value=[run]),
+        patch("ci_sentinel.cli.list_failed_jobs", return_value=[]),
+        patch("ci_sentinel.cli.analyze_log") as analyze,
+    ):
+        assert main(["analyze", "owner/repo"]) == 0
+    assert "No failed jobs with logs" in capsys.readouterr().out
+    analyze.assert_not_called()
+
+
+def test_analyze_rejects_missing_key(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    with patch("ci_sentinel.cli.GitHubClient") as github:
+        assert main(["analyze", "owner/repo"]) == 1
+    assert "GEMINI_API_KEY" in capsys.readouterr().err
+    github.assert_not_called()
+
+
+def test_analyze_reports_gemini_errors(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ci_sentinel.analyzer import GeminiAnalysisError
+    from ci_sentinel.github_actions import WorkflowJob
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    run = WorkflowRun(
+        123, "CI", "main", datetime(2026, 10, 20, tzinfo=UTC), 1,
+        "https://github.com/owner/repo/actions/runs/123",
+    )
+    job = WorkflowJob(11, "test", "failure", "https://github.com/owner/repo/actions/jobs/11")
+    with (
+        patch("ci_sentinel.cli.GitHubClient"),
+        patch("ci_sentinel.cli.genai.Client"),
+        patch("ci_sentinel.cli.list_failed_workflow_runs", return_value=[run]),
+        patch("ci_sentinel.cli.list_failed_jobs", return_value=[job]),
+        patch("ci_sentinel.cli.download_job_logs", return_value="error: build failed"),
+        patch("ci_sentinel.cli.analyze_log", side_effect=GeminiAnalysisError("HTTP 503")),
+    ):
+        assert main(["analyze", "owner/repo"]) == 1
+    assert "HTTP 503" in capsys.readouterr().err
+
+
+def test_analyze_rejects_excessive_limit() -> None:
+    assert main(["analyze", "owner/repo", "--limit", "6"]) == 2

@@ -9,7 +9,7 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 
 class DiagnosticReport(BaseModel):
