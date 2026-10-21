@@ -19,6 +19,12 @@ from ci_sentinel.github_actions import (
     truncate_log,
 )
 from ci_sentinel.github_client import GitHubApiError, GitHubClient
+from ci_sentinel.metrics import (
+    ANALYSES_TOTAL,
+    API_ERRORS_TOTAL,
+    GEMINI_REQUEST_DURATION,
+    JOB_PROCESSING_DURATION,
+)
 
 
 def _repository_arg(value: str) -> Repository:
@@ -125,29 +131,35 @@ def main(argv: list[str] | None = None) -> int:
 
                 analyzed = 0
                 failed = 0
-
                 with genai.Client() as gemini_client:
                     for run in runs:
                         jobs = list_failed_jobs(
                             client, args.repository, run.run_id, attempt=run.attempt
                         )
                         for job in jobs:
-                            log = truncate_log(
-                                download_job_logs(client, args.repository, job.job_id)
-                            )
-                            if not log.strip():
-                                continue
+                            with JOB_PROCESSING_DURATION.time():
+                                log = truncate_log(
+                                    download_job_logs(client, args.repository, job.job_id)
+                                )
+                                if not log.strip():
+                                    continue
 
-                            try:
-                                report = analyze_log(log, client=gemini_client)
-                            except GeminiAnalysisError as exc:
-                                print(f"Gemini analysis failed for job {job.job_id}: {exc}", file=sys.stderr)
-                                failed += 1
-                                continue
+                                try:
+                                    with GEMINI_REQUEST_DURATION.time():
+                                        report = analyze_log(log, client=gemini_client)
+                                except GeminiAnalysisError as exc:
+                                    API_ERRORS_TOTAL.labels(service="gemini").inc()
+                                    print(
+                                        f"Gemini analysis failed for job {job.job_id}: {exc}",
+                                        file=sys.stderr,
+                                    )
+                                    failed += 1
+                                    continue
 
-                            print(f"Run {run.run_id} | {job.name} (job {job.job_id})")
-                            print(report.model_dump_json(indent=2))
-                            analyzed += 1
+                                ANALYSES_TOTAL.labels(category=report.category).inc()
+                                print(f"Run {run.run_id} | {job.name} (job {job.job_id})")
+                                print(report.model_dump_json(indent=2))
+                                analyzed += 1
 
                 if analyzed == 0 and failed == 0:
                     print(f"No failed jobs with logs found for {args.repository}.")
@@ -158,10 +170,12 @@ def main(argv: list[str] | None = None) -> int:
 
             runs = list_failed_workflow_runs(client, args.repository, limit=args.limit)
     except GitHubApiError as exc:
+        API_ERRORS_TOTAL.labels(service="github").inc()
         print(f"GitHub API error: {exc}", file=sys.stderr)
         return 1
 
     except GeminiAnalysisError as exc:
+        API_ERRORS_TOTAL.labels(service="gemini").inc()
         print(f"Gemini analysis error: {exc}", file=sys.stderr)
         return 1
 

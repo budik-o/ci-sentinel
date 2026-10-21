@@ -1,4 +1,3 @@
-
 """Structured CI failure diagnostics and AI-powered log analysis."""
 
 from __future__ import annotations
