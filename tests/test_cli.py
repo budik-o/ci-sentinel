@@ -26,6 +26,9 @@ def test_help_exits_successfully() -> None:
     assert main(["--help"]) == 0
 
 
+# Step 3: functional list-failures CLI
+
+
 def test_list_failures_prints_runs(capsys: pytest.CaptureFixture[str]) -> None:
     run = WorkflowRun(
         run_id=123,
@@ -69,6 +72,9 @@ def test_list_failures_reports_api_error(capsys: pytest.CaptureFixture[str]) -> 
     assert "Forbidden" in capsys.readouterr().err
 
 
+# Step 4: inspect-run CLI
+
+
 def test_inspect_run_lists_only_failed_jobs(capsys: pytest.CaptureFixture[str]) -> None:
     from ci_sentinel.github_actions import WorkflowJob
 
@@ -101,3 +107,20 @@ def test_inspect_run_reports_api_error(capsys: pytest.CaptureFixture[str]) -> No
         with patch("ci_sentinel.cli.list_failed_jobs", side_effect=GitHubApiError("Forbidden")):
             assert main(["inspect-run", "owner/repo", "123"]) == 1
     assert "Forbidden" in capsys.readouterr().err
+
+
+def test_inspect_run_truncates_long_logs(capsys: pytest.CaptureFixture[str]) -> None:
+    from ci_sentinel.github_actions import WorkflowJob
+
+    job = WorkflowJob(11, "test", "failure", "https://github.com/owner/repo/actions/jobs/11")
+    raw_log = "setup line\n" * 2_000 + "error: tests failed\n"
+
+    with patch("ci_sentinel.cli.GitHubClient"):
+        with patch("ci_sentinel.cli.list_failed_jobs", return_value=[job]):
+            with patch("ci_sentinel.cli.download_job_logs", return_value=raw_log):
+                assert main(["inspect-run", "owner/repo", "123", "--logs"]) == 0
+
+    output = capsys.readouterr().out
+    assert "earlier log output omitted" in output
+    assert "error: tests failed" in output
+    assert raw_log not in output

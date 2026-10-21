@@ -10,6 +10,7 @@ from typing import Any
 from ci_sentinel.github_client import GitHubApiError, GitHubClient
 from ci_sentinel.iso_datetime import parse_iso_datetime
 
+MAX_LOG_CHARS = 12_000
 
 @dataclass(frozen=True, slots=True)
 class Repository:
@@ -142,3 +143,12 @@ def download_job_logs(client: GitHubClient, repository: Repository, job_id: int)
     # requests.Session.get follows the GitHub 302 redirect automatically.
     with client.get(path) as response:
         return response.text
+
+
+def truncate_log(log: str) -> str:
+    """Keep the last 12,000 characters of a log."""
+    if len(log) <= MAX_LOG_CHARS:
+        return log
+
+    notice = "[... earlier log output omitted ...]\n"
+    return notice + log[-(MAX_LOG_CHARS - len(notice)):]

@@ -10,7 +10,7 @@ import pytest
 import requests
 
 from ci_sentinel import github_client
-from ci_sentinel.github_actions import Repository, list_failed_workflow_runs
+from ci_sentinel.github_actions import Repository, list_failed_workflow_runs, truncate_log
 from ci_sentinel.github_client import (
     API_ROOT,
     GitHubApiError,
@@ -302,3 +302,17 @@ def test_download_job_logs_returns_plain_text() -> None:
 
     assert result == "Error: tests failed\n"
     assert session.get.call_args.args[0].endswith("/actions/jobs/11/logs")
+
+
+def test_truncate_log_keeps_short_logs_unchanged() -> None:
+    log = "error: compilation failed\n"
+    assert truncate_log(log) == log
+
+
+def test_truncate_log_preserves_end_and_respects_limit() -> None:
+    log = "setup output\n" * 2_000 + "error: compilation failed\n"
+    result = truncate_log(log)
+
+    assert len(result) == 12_000
+    assert result.startswith("[... earlier log output omitted ...]")
+    assert result.endswith("error: compilation failed\n")

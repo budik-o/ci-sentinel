@@ -12,6 +12,7 @@ from ci_sentinel.github_actions import (
     download_job_logs,
     list_failed_jobs,
     list_failed_workflow_runs,
+    truncate_log,
 )
 from ci_sentinel.github_client import GitHubApiError, GitHubClient
 
@@ -90,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  URL: {job.url}")
                     if args.logs:
                         print(f"  Logs for job {job.job_id}:")
-                        print(download_job_logs(client, args.repository, job.job_id))
+                        print(truncate_log(download_job_logs(client, args.repository, job.job_id)))
                 return 0
 
             runs = list_failed_workflow_runs(client, args.repository, limit=args.limit)
