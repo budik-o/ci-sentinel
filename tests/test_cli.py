@@ -1,3 +1,5 @@
+"""Tests for CLI commands, argument parsing, and error handling."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -24,9 +26,6 @@ def test_unknown_option_returns_usage_error() -> None:
 
 def test_help_exits_successfully() -> None:
     assert main(["--help"]) == 0
-
-
-# Step 3: functional list-failures CLI
 
 
 def test_list_failures_prints_runs(capsys: pytest.CaptureFixture[str]) -> None:
@@ -70,9 +69,6 @@ def test_list_failures_reports_api_error(capsys: pytest.CaptureFixture[str]) -> 
         ):
             assert main(["list-failures", "owner/repo"]) == 1
     assert "Forbidden" in capsys.readouterr().err
-
-
-# Step 4: inspect-run CLI
 
 
 def test_inspect_run_lists_only_failed_jobs(capsys: pytest.CaptureFixture[str]) -> None:
