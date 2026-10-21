@@ -1,3 +1,4 @@
+"""Repository identifiers and GitHub Actions workflow/job retrieval."""
 
 from __future__ import annotations
 
@@ -49,6 +50,16 @@ class WorkflowRun:
     url: str
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowJob:
+    """Relevant details of a failed workflow job."""
+
+    job_id: int
+    name: str
+    conclusion: str
+    url: str
+
+
 def _parse_workflow_run(value: dict[str, Any]) -> WorkflowRun:
     """Convert a GitHub API workflow run into a WorkflowRun."""
     return WorkflowRun(
@@ -73,10 +84,7 @@ def list_failed_workflow_runs(
 
     path = f"/repos/{repository.owner}/{repository.name}/actions/runs"
 
-    with client.get(
-        path,
-        params={"status": "failure", "per_page": limit},
-    ) as response:
+    with client.get(path, params={"status": "failure", "per_page": limit}) as response:
         try:
             payload = response.json()
         except ValueError as exc:
@@ -91,3 +99,46 @@ def list_failed_workflow_runs(
         raise GitHubApiError("Unexpected GitHub workflow run response format.") from exc
 
     return sorted(runs, key=lambda run: run.created_at, reverse=True)[:limit]
+
+
+def list_failed_jobs(
+    client: GitHubClient,
+    repository: Repository,
+    run_id: int,
+    *,
+    attempt: int | None = None,
+) -> list[WorkflowJob]:
+    """Fetch failed or timed-out jobs from the latest (or selected) run attempt.
+
+    Only the first page (up to 100 jobs) is fetched.
+    """
+    path = f"/repos/{repository}/actions/runs/{run_id}"
+    if attempt is not None:
+        path += f"/attempts/{attempt}"
+    path += "/jobs"
+
+    with client.get(path, params={"per_page": 100}) as response:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise GitHubApiError("GitHub returned invalid JSON for workflow jobs.") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+        raise GitHubApiError("GitHub response is missing the 'jobs' list.")
+
+    try:
+        return [
+            WorkflowJob(job["id"], job["name"], job["conclusion"], job["html_url"])
+            for job in payload["jobs"]
+            if job["conclusion"] in {"failure", "timed_out"}
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GitHubApiError("Unexpected GitHub workflow job response format.") from exc
+
+
+def download_job_logs(client: GitHubClient, repository: Repository, job_id: int) -> str:
+    """Download plain-text logs for a job, following GitHub's temporary redirect."""
+    path = f"/repos/{repository}/actions/jobs/{job_id}/logs"
+    # requests.Session.get follows the GitHub 302 redirect automatically.
+    with client.get(path) as response:
+        return response.text

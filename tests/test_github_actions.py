@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import Mock
 
 import pytest
@@ -94,13 +94,13 @@ def test_rate_limited_403_has_distinct_message() -> None:
 
 def test_parse_github_utc_timestamp() -> None:
     assert parse_iso_datetime("2026-10-20T12:30:00Z") == datetime(
-        2026, 10, 20, 12, 30, tzinfo=timezone.utc
+        2026, 10, 20, 12, 30, tzinfo=UTC
     )
 
 
 def test_parse_offset_timestamp() -> None:
-    assert parse_iso_datetime("2026-10-20T14:30:00+02:00").astimezone(timezone.utc) == (
-        datetime(2026, 10, 20, 12, 30, tzinfo=timezone.utc)
+    assert parse_iso_datetime("2026-10-20T14:30:00+02:00").astimezone(UTC) == (
+        datetime(2026, 10, 20, 12, 30, tzinfo=UTC)
     )
 
 
@@ -232,7 +232,7 @@ def test_list_failed_runs_fetches_and_parses_results() -> None:
     assert runs[0].run_id == 123
     assert runs[0].name == "CI"
     assert runs[0].branch == "main"
-    assert runs[0].created_at == datetime(2026, 10, 20, 12, tzinfo=timezone.utc)
+    assert runs[0].created_at == datetime(2026, 10, 20, 12, tzinfo=UTC)
     assert session.get.call_args.args == (f"{API_ROOT}/repos/owner/repo/actions/runs",)
     assert session.get.call_args.kwargs["params"] == {"status": "failure", "per_page": 5}
 
@@ -253,3 +253,52 @@ def test_list_failed_runs_propagates_http_errors() -> None:
     session.get.return_value = make_response(403)
     with pytest.raises(GitHubApiError, match="forbidden"):
         list_failed_workflow_runs(GitHubClient(session=session), Repository.parse("owner/repo"))
+
+
+def test_list_failed_jobs_filters_results() -> None:
+    from ci_sentinel.github_actions import list_failed_jobs
+
+    jobs = [
+        {"id": 10, "name": "build", "conclusion": "success", "html_url": "https://example/10"},
+        {"id": 11, "name": "test", "conclusion": "failure", "html_url": "https://example/11"},
+        {"id": 12, "name": "lint", "conclusion": "timed_out", "html_url": "https://example/12"},
+    ]
+    session = Mock(spec=requests.Session)
+    session.get.return_value = make_response(200, json.dumps({"jobs": jobs}))
+
+    result = list_failed_jobs(GitHubClient(session=session), Repository.parse("owner/repo"), 123)
+
+    assert [job.job_id for job in result] == [11, 12]
+    assert session.get.call_args.args[0] == f"{API_ROOT}/repos/owner/repo/actions/runs/123/jobs"
+    assert session.get.call_args.kwargs["params"] == {"per_page": 100}
+
+
+def test_list_failed_jobs_supports_run_attempt() -> None:
+    from ci_sentinel.github_actions import list_failed_jobs
+
+    session = Mock(spec=requests.Session)
+    session.get.return_value = make_response(200, '{"jobs": []}')
+    assert list_failed_jobs(
+        GitHubClient(session=session), Repository.parse("owner/repo"), 123, attempt=2
+    ) == []
+    assert session.get.call_args.args[0].endswith("/runs/123/attempts/2/jobs")
+
+
+def test_list_failed_jobs_rejects_invalid_response() -> None:
+    from ci_sentinel.github_actions import list_failed_jobs
+
+    session = Mock(spec=requests.Session)
+    session.get.return_value = make_response(200, '{}')
+    with pytest.raises(GitHubApiError, match="jobs"):
+        list_failed_jobs(GitHubClient(session=session), Repository.parse("owner/repo"), 123)
+
+
+def test_download_job_logs_returns_plain_text() -> None:
+    from ci_sentinel.github_actions import download_job_logs
+
+    session = Mock(spec=requests.Session)
+    session.get.return_value = make_response(200, "Error: tests failed\n")
+    result = download_job_logs(GitHubClient(session=session), Repository.parse("owner/repo"), 11)
+
+    assert result == "Error: tests failed\n"
+    assert session.get.call_args.args[0].endswith("/actions/jobs/11/logs")

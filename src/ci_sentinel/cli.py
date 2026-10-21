@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import timezone
+from datetime import UTC
 
 from ci_sentinel import __version__
-from ci_sentinel.github_actions import Repository, list_failed_workflow_runs
+from ci_sentinel.github_actions import (
+    Repository,
+    download_job_logs,
+    list_failed_jobs,
+    list_failed_workflow_runs,
+)
 from ci_sentinel.github_client import GitHubApiError, GitHubClient
 
 
@@ -30,6 +35,17 @@ def _limit_arg(value: str) -> int:
     return limit
 
 
+def _positive_int_arg(value: str) -> int:
+    """Validate an ID or run attempt number."""
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected a positive integer.") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("Expected a positive integer.")
+    return number
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse CLI arguments and return a conventional process exit code."""
     parser = argparse.ArgumentParser(
@@ -45,10 +61,17 @@ def main(argv: list[str] | None = None) -> int:
         "--limit", type=_limit_arg, default=5, metavar="N", help="Number of runs (1-100)."
     )
 
+    inspect = commands.add_parser("inspect-run", help="Inspect failed jobs in a workflow run.")
+    inspect.add_argument("repository", type=_repository_arg, metavar="owner/repo")
+    inspect.add_argument("run_id", type=_positive_int_arg, metavar="RUN_ID")
+    inspect.add_argument(
+        "--attempt", type=_positive_int_arg, metavar="N", help="Inspect a specific run attempt."
+    )
+    inspect.add_argument("--logs", action="store_true", help="Print full logs for failed jobs.")
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        # argparse raises SystemExit for --help, --version, and invalid arguments.
         return exc.code if isinstance(exc.code, int) else 1
 
     if args.command is None:
@@ -57,6 +80,19 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with GitHubClient() as client:
+            if args.command == "inspect-run":
+                jobs = list_failed_jobs(client, args.repository, args.run_id, attempt=args.attempt)
+                if not jobs:
+                    print(f"No failed jobs found for run {args.run_id} in {args.repository}.")
+                    return 0
+                for job in jobs:
+                    print(f"- {job.name} (job {job.job_id}, {job.conclusion})")
+                    print(f"  URL: {job.url}")
+                    if args.logs:
+                        print(f"  Logs for job {job.job_id}:")
+                        print(download_job_logs(client, args.repository, job.job_id))
+                return 0
+
             runs = list_failed_workflow_runs(client, args.repository, limit=args.limit)
     except GitHubApiError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -68,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Recent failed workflow runs for {args.repository}:")
     for run in runs:
-        created = run.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        created = run.created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
         print(f"- {run.name} (run {run.run_id}, attempt {run.attempt})")
         print(f"  Branch: {run.branch or '(unknown)'} | Created: {created}")
         print(f"  URL: {run.url}")
