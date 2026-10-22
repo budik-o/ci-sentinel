@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: CI Sentinel
+    orgId: 1
+    folder: CI Sentinel
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards
