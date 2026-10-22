@@ -1,0 +1,20 @@
+services:
+  ci-sentinel:
+    build: .
+    command: ["serve", "${CI_SENTINEL_REPOSITORY:?Set CI_SENTINEL_REPOSITORY in .env}", "--interval", "120"]
+    env_file: .env
+    environment:
+      CI_SENTINEL_METRICS_HOST: "0.0.0.0"
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - ci-sentinel
+
+volumes:
+  prometheus_data:
