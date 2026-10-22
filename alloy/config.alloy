@@ -1,0 +1,22 @@
+// Collect only CI Sentinel logs, not the other containers' logs.
+discovery.docker "ci_sentinel" {
+  host = "unix:///var/run/docker.sock"
+
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.service=ci-sentinel"]
+  }
+}
+
+loki.source.docker "ci_sentinel" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.docker.ci_sentinel.targets
+  labels     = {"app" = "ci-sentinel"}
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

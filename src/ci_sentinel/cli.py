@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -67,6 +68,7 @@ def _analyze_runs(
     runs: list[WorkflowRun],
     *,
     processed: set[tuple[int, int, int]] | None = None,
+    structured_output: bool = False,
 ) -> tuple[int, int]:
     """Analyze failed jobs, optionally skipping previously processed attempts."""
 
@@ -96,8 +98,22 @@ def _analyze_runs(
                     continue
 
                 ANALYSES_TOTAL.labels(category=report.category).inc()
-                print(f"Run {run.run_id} | {job.name} (job {job.job_id})", flush=True)
-                print(report.model_dump_json(indent=2), flush=True)
+                if structured_output:
+                    # One JSON record per diagnosis for Loki; no raw CI logs.
+                    event = {
+                        "event": "ci_diagnostic",
+                        "repository": str(repository),
+                        "run_id": run.run_id,
+                        "attempt": run.attempt,
+                        "job_id": job.job_id,
+                        "job_name": job.name,
+                        "job_url": job.url,
+                        **report.model_dump(),
+                    }
+                    print(json.dumps(event, ensure_ascii=False), flush=True)
+                else:
+                    print(f"Run {run.run_id} | {job.name} (job {job.job_id})", flush=True)
+                    print(report.model_dump_json(indent=2), flush=True)
                 analyzed += 1
                 if processed is not None:
                     processed.add(key)
@@ -130,7 +146,10 @@ def _serve(
             while True:
                 try:
                     runs = list_failed_workflow_runs(github, repository, limit=limit)
-                    _analyze_runs(github, gemini, repository, runs, processed=processed)
+                    _analyze_runs(
+                        github, gemini, repository, runs,
+                        processed=processed, structured_output=True,
+                    )
                 except GitHubApiError as exc:
                     API_ERRORS_TOTAL.labels(service="github").inc()
                     print(f"GitHub API error: {exc}", file=sys.stderr)

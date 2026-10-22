@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import Mock, patch
 
@@ -322,3 +323,34 @@ def test_serve_continues_after_github_error(monkeypatch: pytest.MonkeyPatch) -> 
 )
 def test_serve_rejects_invalid_options(option: list[str]) -> None:
     assert main(["serve", "owner/repo", *option]) == 2
+
+
+def test_serve_emits_structured_diagnostic_log(capsys: pytest.CaptureFixture[str]) -> None:
+    """Monitoring emits one searchable JSON event without changing CLI reports."""
+    from ci_sentinel.analyzer import DiagnosticReport
+    from ci_sentinel.cli import _analyze_runs
+    from ci_sentinel.github_actions import Repository, WorkflowJob
+
+    run = WorkflowRun(123, "CI", "main", datetime(2026, 10, 20, tzinfo=UTC), 1, "run-url")
+    job = WorkflowJob(11, "test", "failure", "https://github.com/owner/repo/actions/jobs/11")
+    report = DiagnosticReport(
+        category="test", root_cause="Assertion failed", suggested_fix="Fix assertion",
+        confidence_score=0.9,
+    )
+    with (
+        patch("ci_sentinel.cli.list_failed_jobs", return_value=[job]),
+        patch("ci_sentinel.cli.download_job_logs", return_value="failed test"),
+        patch("ci_sentinel.cli.analyze_log", return_value=report),
+    ):
+        assert _analyze_runs(
+            Mock(), Mock(), Repository.parse("owner/repo"), [run],
+            structured_output=True,
+        ) == (1, 0)
+
+    diagnostic = json.loads(capsys.readouterr().out.splitlines()[0])
+    assert diagnostic["event"] == "ci_diagnostic"
+    assert diagnostic["job_id"] == 11
+    assert diagnostic["category"] == "test"
+    assert diagnostic["root_cause"] == "Assertion failed"
+    assert diagnostic["job_url"] == job.url
+    assert "failed test" not in diagnostic.values()

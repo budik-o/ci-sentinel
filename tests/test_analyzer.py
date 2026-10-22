@@ -37,7 +37,11 @@ def test_rejects_out_of_range_confidence(score: float) -> None:
 
 
 def test_requires_root_cause() -> None:
-    report_without_cause = {key: value for key, value in VALID_REPORT.items() if key != "root_cause"}
+    report_without_cause = {
+        key: value
+        for key, value in VALID_REPORT.items()
+        if key != "root_cause"
+    }
 
     with pytest.raises(ValidationError):
         DiagnosticReport.model_validate(report_without_cause)

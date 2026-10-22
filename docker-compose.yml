@@ -1,11 +1,12 @@
-
 services:
   ci-sentinel:
     build: .
-    command: ["serve", "${CI_SENTINEL_REPOSITORY:?Set CI_SENTINEL_REPOSITORY in .env}", "--interval", "120"]
+    command: ["serve", "${CI_SENTINEL_REPOSITORY:?Set CI_SENTINEL_REPOSITORY in .env}", "--interval", "120", "--limit", "3"]
     env_file: .env
     environment:
       CI_SENTINEL_METRICS_HOST: "0.0.0.0"
+    depends_on:
+      - alloy
 
   prometheus:
     image: prom/prometheus:v3.15.0
@@ -17,6 +18,22 @@ services:
     depends_on:
       - ci-sentinel
 
+  loki:
+    image: grafana/loki:3.7.8
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.20.1
+    command: ["run", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
   grafana:
     image: grafana/grafana:13.2.4
     ports:
@@ -27,7 +44,9 @@ services:
       - grafana_data:/var/lib/grafana
     depends_on:
       - prometheus
+      - loki
 
 volumes:
   prometheus_data:
   grafana_data:
+  loki_data:
