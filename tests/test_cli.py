@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -230,3 +230,95 @@ def test_analyze_reports_gemini_errors(
 
 def test_analyze_rejects_excessive_limit() -> None:
     assert main(["analyze", "owner/repo", "--limit", "6"]) == 2
+
+
+def test_serve_skips_already_analyzed_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ci_sentinel.analyzer import DiagnosticReport
+    from ci_sentinel.github_actions import WorkflowJob
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("CI_SENTINEL_METRICS_HOST", raising=False)
+    run = WorkflowRun(
+        123, "CI", "main", datetime(2026, 10, 20, tzinfo=UTC), 1, "url"
+    )
+    job = WorkflowJob(11, "test", "failure", "url")
+    report = DiagnosticReport(
+        category="test", root_cause="Assertion failed", suggested_fix="Fix assertion",
+        confidence_score=0.9,
+    )
+    with (
+        patch("ci_sentinel.cli.start_http_server") as start_server,
+        patch("ci_sentinel.cli.time.sleep", side_effect=[None, KeyboardInterrupt]),
+        patch("ci_sentinel.cli.GitHubClient"),
+        patch("ci_sentinel.cli.genai.Client"),
+        patch("ci_sentinel.cli.list_failed_workflow_runs", return_value=[run]) as get_runs,
+        patch("ci_sentinel.cli.list_failed_jobs", return_value=[job]),
+        patch("ci_sentinel.cli.download_job_logs", return_value="tests failed") as get_logs,
+        patch("ci_sentinel.cli.analyze_log", return_value=report) as analyze,
+    ):
+        start_server.return_value = (Mock(), Mock())
+        assert main(["serve", "owner/repo", "--interval", "1"]) == 0
+
+    assert get_runs.call_count == 2
+    get_logs.assert_called_once()
+    analyze.assert_called_once()
+    start_server.assert_called_once_with(8000, addr="127.0.0.1")
+    start_server.return_value[0].shutdown.assert_called_once()
+
+
+def test_serve_retries_jobs_after_gemini_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ci_sentinel.analyzer import DiagnosticReport, GeminiAnalysisError
+    from ci_sentinel.github_actions import WorkflowJob
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("CI_SENTINEL_METRICS_HOST", "0.0.0.0")
+    run = WorkflowRun(123, "CI", "main", datetime(2026, 10, 20, tzinfo=UTC), 1, "url")
+    job = WorkflowJob(11, "test", "failure", "url")
+    report = DiagnosticReport(
+        category="test", root_cause="Assertion failed", suggested_fix="Fix assertion",
+        confidence_score=0.9,
+    )
+    with (
+        patch("ci_sentinel.cli.start_http_server", return_value=(Mock(), Mock())) as start_server,
+        patch("ci_sentinel.cli.time.sleep", side_effect=[None, KeyboardInterrupt]),
+        patch("ci_sentinel.cli.GitHubClient"),
+        patch("ci_sentinel.cli.genai.Client"),
+        patch("ci_sentinel.cli.list_failed_workflow_runs", return_value=[run]),
+        patch("ci_sentinel.cli.list_failed_jobs", return_value=[job]),
+        patch("ci_sentinel.cli.download_job_logs", return_value="tests failed"),
+        patch(
+            "ci_sentinel.cli.analyze_log",
+            side_effect=[GeminiAnalysisError("HTTP 503"), report],
+        ) as analyze,
+    ):
+        assert main(["serve", "owner/repo", "--interval", "1"]) == 0
+
+    assert analyze.call_count == 2
+    start_server.assert_called_once_with(8000, addr="0.0.0.0")
+
+
+def test_serve_continues_after_github_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    with (
+        patch("ci_sentinel.cli.start_http_server", return_value=(Mock(), Mock())),
+        patch("ci_sentinel.cli.time.sleep", side_effect=[None, KeyboardInterrupt]),
+        patch("ci_sentinel.cli.GitHubClient"),
+        patch("ci_sentinel.cli.genai.Client"),
+        patch(
+            "ci_sentinel.cli.list_failed_workflow_runs",
+            side_effect=[GitHubApiError("HTTP 403"), []],
+        ) as get_runs,
+    ):
+        assert main(["serve", "owner/repo", "--interval", "1"]) == 0
+
+    assert get_runs.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "option", [
+        ["--interval", "0"],
+        ["--limit", "6"],
+    ],
+)
+def test_serve_rejects_invalid_options(option: list[str]) -> None:
+    assert main(["serve", "owner/repo", *option]) == 2

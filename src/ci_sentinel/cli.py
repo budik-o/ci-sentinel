@@ -5,14 +5,17 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import UTC
 
 from google import genai
+from prometheus_client import start_http_server
 
 from ci_sentinel import __version__
 from ci_sentinel.analyzer import GeminiAnalysisError, analyze_log
 from ci_sentinel.github_actions import (
     Repository,
+    WorkflowRun,
     download_job_logs,
     list_failed_jobs,
     list_failed_workflow_runs,
@@ -57,6 +60,90 @@ def _positive_int_arg(value: str) -> int:
     return number
 
 
+def _analyze_runs(
+    github: GitHubClient,
+    gemini: genai.Client,
+    repository: Repository,
+    runs: list[WorkflowRun],
+    *,
+    processed: set[tuple[int, int, int]] | None = None,
+) -> tuple[int, int]:
+    """Analyze failed jobs, optionally skipping previously processed attempts."""
+
+    analyzed = 0
+    failed = 0
+    for run in runs:
+        jobs = list_failed_jobs(github, repository, run.run_id, attempt=run.attempt)
+        for job in jobs:
+            key = (run.run_id, run.attempt, job.job_id)
+            if processed is not None and key in processed:
+                continue
+
+            with JOB_PROCESSING_DURATION.time():
+                log = truncate_log(download_job_logs(github, repository, job.job_id))
+                if not log.strip():
+                    if processed is not None:
+                        processed.add(key)
+                    continue
+
+                try:
+                    with GEMINI_REQUEST_DURATION.time():
+                        report = analyze_log(log, client=gemini)
+                except GeminiAnalysisError as exc:
+                    API_ERRORS_TOTAL.labels(service="gemini").inc()
+                    print(f"Gemini analysis failed for job {job.job_id}: {exc}", file=sys.stderr)
+                    failed += 1
+                    continue
+
+                ANALYSES_TOTAL.labels(category=report.category).inc()
+                print(f"Run {run.run_id} | {job.name} (job {job.job_id})", flush=True)
+                print(report.model_dump_json(indent=2), flush=True)
+                analyzed += 1
+                if processed is not None:
+                    processed.add(key)
+
+    if analyzed or failed:
+        print(f"\nAnalysis complete: {analyzed} successful, {failed} failed.", flush=True)
+    elif processed is None:
+        print(f"No failed jobs with logs found for {repository}.")
+    return analyzed, failed
+
+
+def _serve(
+    repository: Repository,
+    *,
+    limit: int,
+    interval: int,
+) -> int:
+    """Poll for new CI failures while serving Prometheus metrics."""
+    host = os.getenv("CI_SENTINEL_METRICS_HOST", "127.0.0.1")
+    server, thread = start_http_server(8000, addr=host)
+    processed: set[tuple[int, int, int]] = set()
+    print(
+        f"Monitoring {repository} every {interval}s; "
+        f"metrics at http://{host}:8000/metrics",
+        flush=True,
+    )
+
+    try:
+        with GitHubClient() as github, genai.Client() as gemini:
+            while True:
+                try:
+                    runs = list_failed_workflow_runs(github, repository, limit=limit)
+                    _analyze_runs(github, gemini, repository, runs, processed=processed)
+                except GitHubApiError as exc:
+                    API_ERRORS_TOTAL.labels(service="github").inc()
+                    print(f"GitHub API error: {exc}", file=sys.stderr)
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped.")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse CLI arguments and return a conventional process exit code."""
     parser = argparse.ArgumentParser(
@@ -93,6 +180,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Number of recent failed workflow runs to analyze (1-5; default: 1).",
     )
 
+    monitor = commands.add_parser("serve", help="Monitor failures and expose Prometheus metrics.")
+    monitor.add_argument("repository", type=_repository_arg, metavar="owner/repo")
+    monitor.add_argument(
+        "--limit", type=_limit_arg, choices=range(1, 6), default=1, metavar="N",
+        help="Number of recent failed workflow runs to check (1-5; default: 1).",
+    )
+    monitor.add_argument(
+        "--interval", type=_positive_int_arg, default=120, metavar="SECONDS",
+        help="Polling interval in seconds (default: 120).",
+    )
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -102,11 +200,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
 
-    if args.command == "analyze" and not (
+    if args.command in {"analyze", "serve"} and not (
         os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     ):
         print("Error: Set GEMINI_API_KEY to run AI analysis.", file=sys.stderr)
         return 1
+
+    if args.command == "serve":
+        try:
+            return _serve(
+                args.repository, limit=args.limit, interval=args.interval,
+            )
+        except OSError as exc:
+            print(f"Metrics server error: {exc}", file=sys.stderr)
+            return 1
 
     try:
         with GitHubClient() as client:
@@ -128,44 +235,8 @@ def main(argv: list[str] | None = None) -> int:
                 if not runs:
                     print(f"No failed workflow runs found for {args.repository}.")
                     return 0
-
-                analyzed = 0
-                failed = 0
                 with genai.Client() as gemini_client:
-                    for run in runs:
-                        jobs = list_failed_jobs(
-                            client, args.repository, run.run_id, attempt=run.attempt
-                        )
-                        for job in jobs:
-                            with JOB_PROCESSING_DURATION.time():
-                                log = truncate_log(
-                                    download_job_logs(client, args.repository, job.job_id)
-                                )
-                                if not log.strip():
-                                    continue
-
-                                try:
-                                    with GEMINI_REQUEST_DURATION.time():
-                                        report = analyze_log(log, client=gemini_client)
-                                except GeminiAnalysisError as exc:
-                                    API_ERRORS_TOTAL.labels(service="gemini").inc()
-                                    print(
-                                        f"Gemini analysis failed for job {job.job_id}: {exc}",
-                                        file=sys.stderr,
-                                    )
-                                    failed += 1
-                                    continue
-
-                                ANALYSES_TOTAL.labels(category=report.category).inc()
-                                print(f"Run {run.run_id} | {job.name} (job {job.job_id})")
-                                print(report.model_dump_json(indent=2))
-                                analyzed += 1
-
-                if analyzed == 0 and failed == 0:
-                    print(f"No failed jobs with logs found for {args.repository}.")
-                else:
-                    print(f"\nAnalysis complete: {analyzed} successful, {failed} failed.")
-
+                    _, failed = _analyze_runs(client, gemini_client, args.repository, runs)
                 return 1 if failed else 0
 
             runs = list_failed_workflow_runs(client, args.repository, limit=args.limit)
